@@ -19,5 +19,5 @@ ENV PATH="/home/helios/.helios/bin:${PATH}"
 RUN curl -fsSL https://raw.githubusercontent.com/a16z/helios/master/heliosup/install | bash && \
     /bin/bash -c 'heliosup'
 
-# Set a default command
-CMD ["/bin/bash"]
+# Set helios as the entrypoint
+ENTRYPOINT ["helios"]
