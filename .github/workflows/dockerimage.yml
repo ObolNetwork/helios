@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - oisin/dockerbuild
 
 jobs:
   build-docker:
