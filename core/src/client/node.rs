@@ -7,27 +7,27 @@ use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::BlockResponse;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::rpc::types::{
-    AccessListResult, EIP1186AccountProofResponse, Filter, Log, SyncInfo, SyncStatus,
+    AccessListItem, AccessListResult, EIP1186AccountProofResponse, EIP1186StorageProof, Filter,
+    Log, SyncInfo, SyncStatus,
 };
 use async_trait::async_trait;
 use eyre::{eyre, Result};
+use revm::context::result::ExecutionResult;
 use revm::context_interface::block::BlobExcessGasAndPrice;
-use tokio::time::interval;
 use tokio::{select, sync::broadcast::Sender};
 use tracing::{info, warn};
 
 use helios_common::{
+    execution_provider::ExecutionProivder,
     fork_schedule::ForkSchedule,
     network_spec::NetworkSpec,
-    types::{SubEventRx, SubscriptionEvent, SubscriptionType},
+    types::{EvmError, SubEventRx, SubscriptionEvent, SubscriptionType},
 };
 
 use crate::consensus::Consensus;
 use crate::errors::ClientError;
-use crate::execution::evm::Evm;
 use crate::execution::filter_state::{FilterState, FilterType};
-use crate::execution::providers::ExecutionProivder;
-use crate::time::{SystemTime, UNIX_EPOCH};
+use crate::time::{interval, SystemTime, UNIX_EPOCH};
 
 use super::api::HeliosApi;
 
@@ -55,10 +55,30 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProivder<N>> No
         let run = wasm_bindgen_futures::spawn_local;
 
         run(async move {
+            let mut last_finalized_block_number = None;
+
             loop {
                 select! {
                     block = block_recv.recv() => {
                         if let Some(block) = block {
+                            let block_number = block.header().number();
+                            let timestamp = block.header().timestamp();
+
+                            // Calculate age of the block
+                            let current_time = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+
+                            let age = current_time.saturating_sub(timestamp);
+
+                            info!(
+                                target: "helios::client",
+                                "latest block     number={} age={}s",
+                                block_number,
+                                age
+                            );
+
                             execution_ref.push_block(
                                 block.clone(),
                                 BlockId::Number(BlockNumberOrTag::Latest)
@@ -70,6 +90,18 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProivder<N>> No
                     _ = finalized_block_recv.changed() => {
                         let block = finalized_block_recv.borrow_and_update().clone();
                         if let Some(block) = block {
+                            let block_number = block.header().number();
+
+                            // Only log if this is a new finalized block
+                            if last_finalized_block_number != Some(block_number) {
+                                info!(
+                                    target: "helios::client",
+                                    "finalized block  number={}",
+                                    block_number
+                                );
+                                last_finalized_block_number = Some(block_number);
+                            }
+
                             execution_ref.push_block(
                                 block,
                                 BlockId::Number(BlockNumberOrTag::Finalized)
@@ -149,26 +181,41 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProivder<N>> He
 
     async fn call(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<Bytes> {
         self.check_blocktag_age(&block_id).await?;
-        let mut evm = Evm::new(
+        let (result, ..) = N::transact(
+            tx,
+            false,
             self.execution.clone(),
             self.get_chain_id().await,
             self.fork_schedule,
             block_id,
-        );
+        )
+        .await?;
 
-        Ok(evm.call(tx).await?)
+        let res = match result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            ExecutionResult::Revert { output, .. } => {
+                Err(EvmError::Revert(Some(output.to_vec().into())))
+            }
+            ExecutionResult::Halt { .. } => Err(EvmError::Revert(None)),
+        }?;
+
+        Ok(res)
     }
 
     async fn estimate_gas(&self, tx: &N::TransactionRequest, block_id: BlockId) -> Result<u64> {
         self.check_blocktag_age(&block_id).await?;
-        let mut evm = Evm::new(
+
+        let (result, ..) = N::transact(
+            tx,
+            true,
             self.execution.clone(),
             self.get_chain_id().await,
             self.fork_schedule,
             block_id,
-        );
+        )
+        .await?;
 
-        Ok(evm.estimate_gas(tx).await?)
+        Ok(result.gas_used())
     }
 
     async fn create_access_list(
@@ -177,16 +224,39 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProivder<N>> He
         block: BlockId,
     ) -> Result<AccessListResult> {
         self.check_blocktag_age(&block).await?;
-        let mut evm = Evm::new(
+
+        let (result, accounts) = N::transact(
+            tx,
+            true,
             self.execution.clone(),
             self.get_chain_id().await,
             self.fork_schedule,
             block,
-        );
+        )
+        .await?;
 
-        let res = evm.create_access_list(tx, true).await?;
+        let access_list_result = AccessListResult {
+            access_list: accounts
+                .iter()
+                .map(|(address, account)| {
+                    let storage_keys = account
+                        .storage_proof
+                        .iter()
+                        .map(|EIP1186StorageProof { key, .. }| key.as_b256())
+                        .collect();
+                    AccessListItem {
+                        address: *address,
+                        storage_keys,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            gas_used: U256::from(result.gas_used()),
+            error: matches!(result, ExecutionResult::Revert { .. })
+                .then_some(result.output().unwrap().to_string()),
+        };
 
-        Ok(res.access_list_result)
+        Ok(access_list_result)
     }
 
     async fn get_balance(&self, address: Address, block_id: BlockId) -> Result<U256> {

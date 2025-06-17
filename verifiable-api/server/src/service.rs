@@ -17,14 +17,17 @@ use async_trait::async_trait;
 use eyre::{eyre, Ok, OptionExt, Report, Result};
 use futures::future::try_join_all;
 use rayon::prelude::*;
+use url::Url;
 
-use helios_common::{fork_schedule::ForkSchedule, network_spec::NetworkSpec};
+use helios_common::{
+    execution_provider::BlockProvider, fork_schedule::ForkSchedule, network_spec::NetworkSpec,
+};
 use helios_core::execution::proof::create_transaction_proof;
 use helios_core::execution::providers::block::block_cache::BlockCache;
 use helios_core::execution::providers::rpc::RpcExecutionProvider;
-use helios_core::execution::providers::BlockProvider;
+
 use helios_core::execution::{
-    constants::MAX_SUPPORTED_BLOCKS_TO_PROVE_FOR_LOGS, errors::ExecutionError, evm::Evm,
+    constants::MAX_SUPPORTED_BLOCKS_TO_PROVE_FOR_LOGS, errors::ExecutionError,
     proof::create_receipt_proof,
 };
 use helios_verifiable_api_client::VerifiableApi;
@@ -39,15 +42,15 @@ pub struct ApiService<N: NetworkSpec> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
-    fn new(rpc: &str) -> Self {
+    fn new(rpc_url: &Url) -> Self {
         let client = ClientBuilder::default()
             .layer(RetryBackoffLayer::new(100, 50, 300))
-            .http(rpc.parse().unwrap());
+            .http(rpc_url.to_string().parse().expect("Invalid RPC URL"));
 
-        let provider = ProviderBuilder::<_, _, N>::default().on_client(client);
+        let provider = ProviderBuilder::<_, _, N>::default().connect_client(client);
 
         Self {
-            rpc_url: rpc.to_string(),
+            rpc_url: rpc_url.to_string(),
             rpc: provider,
         }
     }
@@ -225,23 +228,24 @@ impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
 
         // initialize execution provider for the given block
         let block_provider = BlockCache::<N>::new();
-        let provider = RpcExecutionProvider::new(self.rpc_url.parse().unwrap(), block_provider);
+        let provider = RpcExecutionProvider::<N, BlockCache<N>, ()>::new(
+            self.rpc_url.parse().unwrap(),
+            block_provider,
+        );
         provider.push_block(block, block_id).await;
 
         // call EVM with the transaction, collect accounts and storage keys
-        let mut evm = Evm::new(
+        let (.., accounts) = N::transact(
+            &tx,
+            validate_tx,
             Arc::new(provider),
             self.rpc.get_chain_id().await?,
-            ForkSchedule {
-                prague_timestamp: u64::MAX,
-            },
+            ForkSchedule::default(),
             block_id,
-        );
-        let res = evm.create_access_list(&tx, validate_tx).await?;
+        )
+        .await?;
 
-        Ok(ExtendedAccessListResponse {
-            accounts: res.accounts,
-        })
+        Ok(ExtendedAccessListResponse { accounts })
     }
 
     async fn chain_id(&self) -> Result<ChainIdResponse> {

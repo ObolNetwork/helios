@@ -1,10 +1,24 @@
-import { EventEmitter } from "events";
+import { EventEmitter } from "eventemitter3";
 import { v4 as uuidv4 } from "uuid";
-import initWasm, { EthereumClient, OpStackClient, LineaClient } from "./pkg/index";
+import initWasm, { EthereumClient, OpStackClient, LineaClient } from "./pkg";
 
-export async function init() {
-  const wasmData = require("./pkg/index_bg.wasm");
-  await initWasm(wasmData);
+let initPromise: Promise<any> | null = null;
+
+async function ensureInitialized() {
+  if (!initPromise) {
+    initPromise = initWasm();
+  }
+  await initPromise;
+}
+
+/**
+ * Creates a new HeliosProvider instance.
+ * An EIP-1193 compliant Ethereum provider. Treat this the same as you
+ * would window.ethereum when constructing an ethers or web3 provider.
+ */
+export async function createHeliosProvider(config: Config, kind: "ethereum" | "opstack"): Promise<HeliosProvider> {
+  await ensureInitialized();
+  return HeliosProvider.createInternal(config, kind);
 }
 
 /// An EIP-1193 compliant Ethereum provider. Treat this the same as you
@@ -14,8 +28,7 @@ export class HeliosProvider {
   #chainId;
   #eventEmitter;
 
-  /// Do not use this constructor. Instead use the createHeliosProvider function.
-  constructor(config: Config, kind: "ethereum" | "opstack") {
+  private constructor(config: Config, kind: "ethereum" | "opstack") {
     const executionRpc = config.executionRpc;
     const verifiableApi = config.verifiableApi;
 
@@ -46,6 +59,12 @@ export class HeliosProvider {
     this.#chainId = this.#client.chain_id();
     this.#eventEmitter = new EventEmitter();
   }
+
+  /** @internal */
+  static createInternal(config: Config, kind: "ethereum" | "opstack"): HeliosProvider {
+    return new HeliosProvider(config, kind);
+  }
+
 
   async waitSynced() {
     await this.#client.wait_synced();
