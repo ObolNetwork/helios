@@ -9,7 +9,7 @@ use alloy::{
 
 use async_trait::async_trait;
 use helios_common::{
-    execution_provider::ExecutionProivder,
+    execution_provider::ExecutionProvider,
     fork_schedule::ForkSchedule,
     network_spec::NetworkSpec,
     types::{Account, EvmError},
@@ -126,7 +126,7 @@ impl NetworkSpec for OpStack {
         receipt.inner.inner.logs().to_vec()
     }
 
-    async fn transact<E: ExecutionProivder<Self>>(
+    async fn transact<E: ExecutionProvider<Self>>(
         tx: &Self::TransactionRequest,
         validate_tx: bool,
         execution: Arc<E>,
@@ -168,6 +168,10 @@ impl TransactionBuilder<OpStack> for OpTransactionRequest {
 
     fn set_nonce(&mut self, nonce: u64) {
         <TransactionRequest as TransactionBuilder<Ethereum>>::set_nonce(self.as_mut(), nonce);
+    }
+
+    fn take_nonce(&mut self) -> Option<u64> {
+        <TransactionRequest as TransactionBuilder<Ethereum>>::take_nonce(self.as_mut())
     }
 
     fn input(&self) -> Option<&Bytes> {

@@ -961,11 +961,18 @@ async fn test_get_historical_block(helios: &RootProvider, expected: &RootProvide
     let block = helios
         .get_block_by_number(historical_block_num.into())
         .await?;
+
     let expected_block = expected
         .get_block_by_number(historical_block_num.into())
         .await?;
 
     if let (Some(block), Some(expected_block)) = (block, expected_block) {
+        let hash = block.header.hash;
+        let calculated_hash = block.header.hash_slow();
+        if hash != calculated_hash {
+            eyre::bail!("invalid block hash");
+        }
+
         if block.header.number != expected_block.header.number {
             return Err(eyre::eyre!(
                 "Historical block number mismatch: expected {:?}, got {:?}",
@@ -981,6 +988,29 @@ async fn test_get_historical_block(helios: &RootProvider, expected: &RootProvide
             ));
         }
     }
+    Ok(())
+}
+
+async fn test_get_too_old_block(helios: &RootProvider, expected: &RootProvider) -> Result<()> {
+    let latest_block = expected.get_block_number().await?;
+    let latest_block_num = latest_block;
+
+    let old_block_num = latest_block_num.saturating_sub(20000);
+
+    let helios_block = helios.get_block_by_number(old_block_num.into()).await;
+
+    ensure!(
+        helios_block.is_err(),
+        "Helios should return None for a block outside the proof window"
+    );
+
+    let expected_block = expected.get_block_by_number(old_block_num.into()).await?;
+
+    ensure!(
+        expected_block.is_some(),
+        "The trusted provider should have returned the historical block"
+    );
+
     Ok(())
 }
 
@@ -1423,6 +1453,7 @@ async fn rpc_equivalence_tests() {
         spawn_test!(test_get_logs_block_range, "get_logs_block_range"),
         // Historical Data
         spawn_test!(test_get_historical_block, "get_historical_block"),
+        spawn_test!(test_get_too_old_block, "get_too_old_block"),
     ];
 
     // Collect results

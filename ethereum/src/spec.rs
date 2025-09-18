@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use revm::context::result::{ExecutionResult, HaltReason};
 
 use helios_common::{
-    execution_provider::ExecutionProivder,
+    execution_provider::ExecutionProvider,
     fork_schedule::ForkSchedule,
     network_spec::NetworkSpec,
     types::{Account, EvmError},
@@ -97,7 +97,7 @@ impl NetworkSpec for Ethereum {
         receipt.inner.logs().to_vec()
     }
 
-    async fn transact<E: ExecutionProivder<Self>>(
+    async fn transact<E: ExecutionProvider<Self>>(
         tx: &Self::TransactionRequest,
         validate_tx: bool,
         execution: Arc<E>,
@@ -139,6 +139,10 @@ impl TransactionBuilder<Ethereum> for TransactionRequest {
 
     fn set_nonce(&mut self, nonce: u64) {
         self.nonce = Some(nonce);
+    }
+
+    fn take_nonce(&mut self) -> Option<u64> {
+        self.nonce.take()
     }
 
     fn input(&self) -> Option<&Bytes> {
