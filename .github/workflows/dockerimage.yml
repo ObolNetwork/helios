@@ -1,68 +1,119 @@
-name: Build and Deploy Helios Docker Image
+name: Sync Upstream Releases and Build Docker
 
 on:
-  push:
-    branches:
-      - master
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    # Allow manual triggering
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
-  build-docker:
+  check-and-build:
     runs-on: ubuntu-latest
-    name: Build Docker Image
+    name: Sync and Build Docker Image
+
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up QEMU
-      id: qemu
-      uses: docker/setup-qemu-action@v3
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-    - name: Cache Docker layers
-      uses: actions/cache@v4
-      with:
-        path: /tmp/.buildx-cache
-        key: ${{ runner.os }}-buildx-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-buildx-
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-    - name: Define docker image meta data tags
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: |
-          obolnetwork/helios
-          ghcr.io/obolnetwork/helios
-        tags: |
-          type=sha,prefix=
-          type=raw,value=latest
+      - name: Fetch all tags
+        run: git fetch --tags
 
-    - name: Login to Github container registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get latest upstream release
+        id: upstream
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/a16z/helios/releases/latest | jq -r .tag_name)
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream release: $LATEST_TAG"
 
-    - name: Login to Dockerhub container registry
-      uses: docker/login-action@v3
-      with:
-        username: obolnetwork
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Check if tag already exists locally
+        id: check_tag
+        run: |
+          if git rev-parse "${{ steps.upstream.outputs.latest_tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Tag ${{ steps.upstream.outputs.latest_tag }} already exists locally"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Tag ${{ steps.upstream.outputs.latest_tag }} is new, will build Docker image"
+          fi
 
-    - uses: docker/build-push-action@v6
-      with:
-        context: .
-        platforms: linux/amd64,linux/arm64
-        push: true
-        build-args: GITHUB_SHA=${{ github.sha }}
-        tags: ${{ steps.meta.outputs.tags }}
-        cache-from: type=local,src=/tmp/.buildx-cache
-        cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+      - name: Create tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.upstream.outputs.latest_tag }}" -m "Upstream release ${{ steps.upstream.outputs.latest_tag }}"
+          git push origin "${{ steps.upstream.outputs.latest_tag }}"
 
-    - name: Move cache
-      run: |
-        rm -rf /tmp/.buildx-cache
-        mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+      - name: Set up QEMU
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+
+      - name: Login to Github container registry
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Dockerhub container registry
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          username: obolnetwork
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        if: steps.check_tag.outputs.exists == 'false'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            obolnetwork/helios
+            ghcr.io/obolnetwork/helios
+          tags: |
+            type=raw,value=${{ steps.upstream.outputs.latest_tag }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            HELIOS_VERSION=${{ steps.upstream.outputs.latest_tag }}
+
+      - name: Summary
+        run: |
+          echo "### Upstream Release Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest upstream tag**: ${{ steps.upstream.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_tag.outputs.exists }}" == "true" ]; then
+            echo "- **Status**: Already synced (no action taken)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: New release detected and Docker image built" >> $GITHUB_STEP_SUMMARY
+            echo "- **Docker images published**:" >> $GITHUB_STEP_SUMMARY
+            echo "  - obolnetwork/helios:${{ steps.upstream.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "  - obolnetwork/helios:latest" >> $GITHUB_STEP_SUMMARY
+            echo "  - ghcr.io/obolnetwork/helios:${{ steps.upstream.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "  - ghcr.io/obolnetwork/helios:latest" >> $GITHUB_STEP_SUMMARY
+          fi
